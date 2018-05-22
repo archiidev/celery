@@ -8,14 +8,14 @@ from billiard.einfo import ExceptionInfo
 from kombu.exceptions import OperationalError
 from kombu.utils.uuid import uuid
 
-from celery import current_app, group
-from celery import states
+from celery import current_app, group, states
 from celery._state import _task_stack
 from celery.canvas import signature
-from celery.exceptions import Ignore, MaxRetriesExceededError, Reject, Retry
+from celery.exceptions import (Ignore, ImproperlyConfigured,
+                               MaxRetriesExceededError, Reject, Retry)
 from celery.five import items, python_2_unicode_compatible
 from celery.local import class_property
-from celery.result import EagerResult
+from celery.result import EagerResult, denied_join_result
 from celery.utils import abstract
 from celery.utils.functional import mattrgetter, maybe_list
 from celery.utils.imports import instantiate
@@ -26,7 +26,7 @@ from .annotations import resolve_all as resolve_all_annotations
 from .registry import _unpickle_task_v2
 from .utils import appstr
 
-__all__ = ['Context', 'Task']
+__all__ = ('Context', 'Task')
 
 #: extracts attributes related to publishing a message from an object.
 extract_exec_options = mattrgetter(
@@ -38,7 +38,6 @@ extract_exec_options = mattrgetter(
 # We take __repr__ very seriously around here ;)
 R_BOUND_TASK = '<class {0.__name__} of {app}{flags}>'
 R_UNBOUND_TASK = '<unbound {0.__name__}{flags}>'
-R_SELF_TASK = '<@task {0.name} bound to other {0.__self__}>'
 R_INSTANCE = '<@task: {0.name} of {app}{flags}>'
 
 #: Here for backwards compatibility as tasks no longer use a custom meta-class.
@@ -132,7 +131,7 @@ class Context(object):
 
     @property
     def children(self):
-        # children must be an empy list for every thread
+        # children must be an empty list for every thread
         if self._children is None:
             self._children = []
         return self._children
@@ -158,8 +157,8 @@ class Task(object):
     #: Execution strategy used, or the qualified name of one.
     Strategy = 'celery.worker.strategy:default'
 
-    #: This is the instance bound to if the task is a method of a class.
-    __self__ = None
+    #: Request class used, or the qualified name of one.
+    Request = 'celery.worker.request:Request'
 
     #: The application instance associated with this task class.
     _app = None
@@ -374,16 +373,13 @@ class Task(object):
         _task_stack.push(self)
         self.push_request(args=args, kwargs=kwargs)
         try:
-            # add self if this is a bound task
-            if self.__self__ is not None:
-                return self.run(self.__self__, *args, **kwargs)
             return self.run(*args, **kwargs)
         finally:
             self.pop_request()
             _task_stack.pop()
 
     def __reduce__(self):
-        # - tasks are pickled into the name of the task only, and the reciever
+        # - tasks are pickled into the name of the task only, and the receiver
         # - simply grabs it from the local registry.
         # - in later versions the module of the task is also included,
         # - and the receiving side tries to import that module so that
@@ -496,7 +492,7 @@ class Task(object):
             headers (Dict): Message headers to be included in the message.
 
         Returns:
-            ~@AsyncResult: Promise of future evaluation.
+            celery.result.AsyncResult: Promise of future evaluation.
 
         Raises:
             TypeError: If not enough arguments are passed, or too many
@@ -519,12 +515,13 @@ class Task(object):
 
         app = self._get_app()
         if app.conf.task_always_eager:
-            return self.apply(args, kwargs, task_id=task_id or uuid(),
-                              link=link, link_error=link_error, **options)
-        # add 'self' if this is a "task_method".
-        if self.__self__ is not None:
-            args = args if isinstance(args, tuple) else tuple(args or ())
-            args = (self.__self__,) + args
+            with denied_join_result():
+                return self.apply(args, kwargs, task_id=task_id or uuid(),
+                                  link=link, link_error=link_error, **options)
+
+        if self.__v2_compat__:
+            shadow = shadow or self.shadow_name(self(), args, kwargs, options)
+        else:
             shadow = shadow or self.shadow_name(args, kwargs, options)
 
         preopts = self._get_exec_options()
@@ -616,7 +613,7 @@ class Task(object):
                 If no exception was raised it will raise the ``exc``
                 argument provided.
             countdown (float): Time in seconds to delay the retry for.
-            eta (~datetime.dateime): Explicit time and date to run the
+            eta (~datetime.datetime): Explicit time and date to run the
                 retry at.
             max_retries (int): If set, overrides the default retry limit for
                 this execution.  Changes to this parameter don't propagate to
@@ -709,9 +706,6 @@ class Task(object):
 
         app = self._get_app()
         args = args or ()
-        # add 'self' if this is a bound method.
-        if self.__self__ is not None:
-            args = (self.__self__,) + tuple(args)
         kwargs = kwargs or {}
         task_id = task_id or uuid()
         retries = retries or 0
@@ -836,27 +830,26 @@ class Task(object):
         """
         chord = self.request.chord
         if 'chord' in sig.options:
-            if chord:
-                chord = sig.options['chord'] | chord
-            else:
-                chord = sig.options['chord']
+            raise ImproperlyConfigured(
+                "A signature replacing a task must not be part of a chord"
+            )
 
         if isinstance(sig, group):
             sig |= self.app.tasks['celery.accumulate'].s(index=0).set(
-                chord=chord,
                 link=self.request.callbacks,
                 link_error=self.request.errbacks,
             )
-            chord = None
 
         if self.request.chain:
             for t in reversed(self.request.chain):
                 sig |= signature(t, app=self.app)
 
-        sig.freeze(self.request.id,
-                   group_id=self.request.group,
-                   chord=chord,
-                   root_id=self.request.root_id)
+        sig.set(
+            chord=chord,
+            group_id=self.request.group,
+            root_id=self.request.root_id,
+        )
+        sig.freeze(self.request.id)
 
         sig.delay()
         raise Ignore('Replaced by new task')
@@ -875,9 +868,12 @@ class Task(object):
         """
         if not self.request.chord:
             raise ValueError('Current task is not member of any chord')
-        result = sig.freeze(group_id=self.request.group,
-                            chord=self.request.chord,
-                            root_id=self.request.root_id)
+        sig.set(
+            group_id=self.request.group,
+            chord=self.request.chord,
+            root_id=self.request.root_id,
+        )
+        result = sig.freeze()
         self.backend.add_to_chord(self.request.group, result)
         return sig.delay() if not lazy else sig
 
@@ -973,7 +969,7 @@ class Task(object):
 
     def __repr__(self):
         """``repr(task)``."""
-        return _reprtask(self, R_SELF_TASK if self.__self__ else R_INSTANCE)
+        return _reprtask(self, R_INSTANCE)
 
     def _get_request(self):
         """Get current request object."""
@@ -1006,4 +1002,6 @@ class Task(object):
     @property
     def __name__(self):
         return self.__class__.__name__
+
+
 BaseTask = Task  # noqa: E305 XXX compat alias

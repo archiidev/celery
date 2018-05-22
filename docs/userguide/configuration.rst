@@ -47,8 +47,13 @@ names, are the renaming of some prefixes, like ``celerybeat_`` to ``beat_``,
 ``celeryd_`` to ``worker_``, and most of the top level ``celery_`` settings
 have been moved into a new  ``task_`` prefix.
 
-Celery will still be able to read old configuration files, so there's no
-rush in moving to the new settings format.
+.. note::
+
+    Celery will still be able to read old configuration files, so
+    there's no rush in moving to the new settings format. Furthermore,
+    we provide the ``celery upgrade`` command that should handle plenty
+    of cases (including :ref:`Django <latentcall-django-admonition>`).
+
 
 =====================================  ==============================================
 **Setting name**                       **Replace with**
@@ -83,6 +88,7 @@ rush in moving to the new settings format.
 ``CASSANDRA_READ_CONSISTENCY``         :setting:`cassandra_read_consistency`
 ``CASSANDRA_SERVERS``                  :setting:`cassandra_servers`
 ``CASSANDRA_WRITE_CONSISTENCY``        :setting:`cassandra_write_consistency`
+``CASSANDRA_OPTIONS``                  :setting:`cassandra_options`
 ``CELERY_COUCHBASE_BACKEND_SETTINGS``  :setting:`couchbase_backend_settings`
 ``CELERY_MONGODB_BACKEND_SETTINGS``    :setting:`mongodb_backend_settings`
 ``CELERY_EVENT_QUEUE_EXPIRES``         :setting:`event_queue_expires`
@@ -109,7 +115,7 @@ rush in moving to the new settings format.
 ``CELERY_SECURITY_CERTIFICATE``        :setting:`security_certificate`
 ``CELERY_SECURITY_CERT_STORE``         :setting:`security_cert_store`
 ``CELERY_SECURITY_KEY``                :setting:`security_key`
-``CELERY_TASK_ACKS_LATE``              :setting:`task_acks_late`
+``CELERY_ACKS_LATE``                   :setting:`task_acks_late`
 ``CELERY_TASK_ALWAYS_EAGER``           :setting:`task_always_eager`
 ``CELERY_TASK_ANNOTATIONS``            :setting:`task_annotations`
 ``CELERY_TASK_COMPRESSION``            :setting:`task_compression`
@@ -124,8 +130,8 @@ rush in moving to the new settings format.
 ``CELERY_TASK_IGNORE_RESULT``          :setting:`task_ignore_result`
 ``CELERY_TASK_PUBLISH_RETRY``          :setting:`task_publish_retry`
 ``CELERY_TASK_PUBLISH_RETRY_POLICY``   :setting:`task_publish_retry_policy`
-``CELERY_TASK_QUEUES``                 :setting:`task_queues`
-``CELERY_TASK_ROUTES``                 :setting:`task_routes`
+``CELERY_QUEUES``                      :setting:`task_queues`
+``CELERY_ROUTES``                      :setting:`task_routes`
 ``CELERY_TASK_SEND_SENT_EVENT``        :setting:`task_send_sent_event`
 ``CELERY_TASK_SERIALIZER``             :setting:`task_serializer`
 ``CELERYD_TASK_SOFT_TIME_LIMIT``       :setting:`task_soft_time_limit`
@@ -176,8 +182,9 @@ A white-list of content-types/serializers to allow.
 If a message is received that's not in this list then
 the message will be discarded with an error.
 
-By default any content type is enabled, including pickle and yaml,
-so make sure untrusted parties don't have access to your broker.
+By default only json is enabled but any content type can be added,
+including pickle and yaml; when this is the case make sure
+untrusted parties don't have access to your broker.
 See :ref:`guide-security` for more.
 
 Example::
@@ -591,6 +598,27 @@ Can be one of the following:
 .. _`CouchDB`: http://www.couchdb.com/
 .. _`Couchbase`: https://www.couchbase.com/
 .. _`Consul`: https://consul.io/
+
+
+.. setting:: result_backend_transport_options
+
+``result_backend_transport_options``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``{}`` (empty mapping).
+
+A dict of additional options passed to the underlying transport.
+
+See your transport user manual for supported options (if any).
+
+Example setting the visibility timeout (supported by Redis and SQS
+transports):
+
+.. code-block:: python
+
+    result_backend_transport_options = {'visibility_timeout': 18000}  # 5 hours
+
+
 
 .. setting:: result_serializer
 
@@ -1038,6 +1066,22 @@ Named arguments to pass into the authentication provider. For example:
         password: 'cassandra'
     }
 
+.. setting:: cassandra_options
+
+``cassandra_options``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``{}`` (empty mapping).
+
+Named arguments to pass into the ``cassandra.cluster`` class.
+
+.. code-block:: python
+
+    cassandra_options = {
+        'cql_version': '3.2.1'
+        'protocol_version': 3
+    }
+
 Example configuration
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -1202,9 +1246,14 @@ or using the `downloadable version <https://docs.aws.amazon.com/amazondynamodb/l
 of DynamoDB
 `locally <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.Endpoint.html>`_::
 
-    result_backend = 'dynamodb://@localhost:8000
+    result_backend = 'dynamodb://@localhost:8000'
 
-The fields of the URL are defined as follows:
+or using downloadable version or other service with conforming API deployed on any host::
+
+    result_backend = 'dynamodb://@us-east-1'
+    dynamodb_endpoint_url = 'http://192.168.0.40:8000'
+
+The fields of the DynamoDB URL in ``result_backend`` are defined as follows:
 
 #. ``aws_access_key_id & aws_secret_access_key``
 
@@ -1880,6 +1929,13 @@ Default: 4.0.
 The default timeout in seconds before we give up establishing a connection
 to the AMQP server. This setting is disabled when using
 gevent.
+
+.. note::
+
+    The broker connection timeout only applies to a worker attempting to
+    connect to the broker. It does not apply to producer sending a task, see
+    :setting:`broker_transport_options` for how to provide a timeout for that
+    situation.
 
 .. setting:: broker_connection_retry
 
